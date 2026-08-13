@@ -2288,6 +2288,23 @@ impl<I: Index> CascadeWorkspace<I> {
                             memo,
                         );
                     }
+                } else if run_lens.len() == 2 {
+                    // Last level: one merge covering the whole partition, and
+                    // the only place in the cascade with no sibling pair to
+                    // run beside it. Split its output instead.
+                    sample_sort::merge_split(
+                        text,
+                        lp,
+                        &src_sa[src_off..x_end],
+                        &src_sa[x_end..xy_end],
+                        &src_lcp[src_off..x_end],
+                        &src_lcp[x_end..xy_end],
+                        &mut dst_sa[dst_off..dst_end],
+                        &mut dst_lcp[dst_off..dst_end],
+                        max_ctx,
+                        dispatch,
+                        rayon::current_num_threads(),
+                    );
                 } else {
                     sample_sort::merge(
                         text,

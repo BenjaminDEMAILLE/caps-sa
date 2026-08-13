@@ -35,6 +35,7 @@ use crate::lcp::{LcpDispatch, Symbol};
 use crate::lcp_memo::GeometricMemo;
 use crate::limits::{LimitProvider, PlainText};
 use rayon::join;
+use rayon::prelude::*;
 
 /// How many merge steps ahead the text prefetch runs. Large enough to cover a
 /// DRAM round trip at the merge's step rate, small enough that the prefetched
@@ -396,6 +397,12 @@ macro_rules! merge_extension {
 // single source of truth while changing only the LCP-extension expression.
 macro_rules! merge_body {
     ($lookup:tt; $text:ident, $lp:ident, $x:ident, $y:ident, $lcp_x:ident, $lcp_y:ident, $z:ident, $lcp_z:ident, $max_ctx:ident, $dispatch:ident) => {{
+        merge_body!(
+            $lookup; $text, $lp, $x, $y, $lcp_x, $lcp_y, $z, $lcp_z, $max_ctx, $dispatch,
+            0usize, 0usize, 0usize, true
+        )
+    }};
+    ($lookup:tt; $text:ident, $lp:ident, $x:ident, $y:ident, $lcp_x:ident, $lcp_y:ident, $z:ident, $lcp_z:ident, $max_ctx:ident, $dispatch:ident, $from_x:expr, $from_y:expr, $from_m:expr, $x_is_a:expr) => {{
         let len_x = $x.len();
         let len_y = $y.len();
         debug_assert_eq!($z.len(), len_x + len_y);
@@ -414,15 +421,21 @@ macro_rules! merge_body {
 
         // The "swap-on-output-from-B" trick from upstream CaPS-SA: we always
         // label the stream we last output from as `A`, and the other as `B`.
-        let mut arr_a: &[I] = $x;
-        let mut arr_b: &[I] = $y;
-        let mut lcp_a: &[I] = $lcp_x;
-        let mut lcp_b: &[I] = $lcp_y;
-        let mut len_a = len_x;
-        let mut len_b = len_y;
-        let mut i_a: usize = 0;
-        let mut i_b: usize = 0;
-        let mut m: usize = 0;
+        //
+        // A resumed merge starts from a caller-supplied cursor pair, running
+        // LCP and labelling, which is what lets one merge be split into
+        // independent output ranges. A merge from the start is the case
+        // `(0, 0, 0, x-is-a)`.
+        let x_is_a: bool = $x_is_a;
+        let mut arr_a: &[I] = if x_is_a { $x } else { $y };
+        let mut arr_b: &[I] = if x_is_a { $y } else { $x };
+        let mut lcp_a: &[I] = if x_is_a { $lcp_x } else { $lcp_y };
+        let mut lcp_b: &[I] = if x_is_a { $lcp_y } else { $lcp_x };
+        let mut len_a = if x_is_a { len_x } else { len_y };
+        let mut len_b = if x_is_a { len_y } else { len_x };
+        let mut i_a: usize = if x_is_a { $from_x } else { $from_y };
+        let mut i_b: usize = if x_is_a { $from_y } else { $from_x };
+        let mut m: usize = $from_m;
         let mut k: usize = 0;
         let mut lim_a_cache: Option<(usize, usize)> = None;
         let mut lim_b_cache: Option<(usize, usize)> = None;
@@ -519,6 +532,219 @@ pub(crate) fn merge<S, I, L>(
     L: LimitProvider,
 {
     merge_body!(direct; text, lp, x, y, lcp_x, lcp_y, z, lcp_z, max_ctx, dispatch);
+}
+
+/// Resume a two-way merge from a cursor pair, a running LCP, and the label of
+/// the stream the previous output came from.
+///
+/// `x` and `y` are the *remaining* tails of the two runs, `lcp_x[0]` and
+/// `lcp_y[0]` still meaning "shared prefix with the element before this one",
+/// so the caller passes sub-slices rather than offsets. `m` must be the exact
+/// bounded LCP of `x[0]` and `y[0]`, and `x_is_a` must say which run produced
+/// the output immediately before this range. Both are what
+/// [`merge_split`] computes at a cut.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn merge_resume<S, I, L>(
+    text: &[S],
+    lp: &L,
+    x: &[I],
+    y: &[I],
+    lcp_x: &[I],
+    lcp_y: &[I],
+    z: &mut [I],
+    lcp_z: &mut [I],
+    max_ctx: usize,
+    dispatch: LcpDispatch,
+    m: usize,
+    x_is_a: bool,
+) where
+    S: Symbol,
+    I: Index,
+    L: LimitProvider,
+{
+    merge_body!(
+        direct; text, lp, x, y, lcp_x, lcp_y, z, lcp_z, max_ctx, dispatch,
+        0usize, 0usize, m, x_is_a
+    );
+}
+
+/// One output range of a split merge: the two cut pairs bounding it, and the
+/// slices it writes.
+type MergePiece<'a, I> = (usize, usize, usize, usize, &'a mut [I], &'a mut [I]);
+
+/// Output records below which a merge is not worth splitting: the cut search
+/// costs `O(chunks · log n)` suffix comparisons, which only disappears into
+/// the merge itself once the merge is large.
+pub(crate) const MERGE_SPLIT_MIN: usize = 1 << 16;
+
+/// Merge two LCP-annotated runs into `z`, splitting the output into `chunks`
+/// independent ranges merged in parallel.
+///
+/// The cascade's last level merges two runs covering a whole partition in one
+/// sequential call, and that call is what remains when phase 4 runs out of
+/// partitions to overlap. Splitting *that* merge is the thing parallelising
+/// the cascade's earlier pairs cannot do, because the last level has exactly
+/// one pair.
+///
+/// Cuts come from the standard merge path: for an output rank `t`, binary
+/// search the diagonal `i + j = t` for the pair where each run's element
+/// before the cut precedes the other run's element after it. The two pieces of
+/// state the kernel carries across a cut, the running LCP and which run the
+/// previous output came from, are recomputed there, at one LCP call per cut.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn merge_split<S, I, L>(
+    text: &[S],
+    lp: &L,
+    x: &[I],
+    y: &[I],
+    lcp_x: &[I],
+    lcp_y: &[I],
+    z: &mut [I],
+    lcp_z: &mut [I],
+    max_ctx: usize,
+    dispatch: LcpDispatch,
+    chunks: usize,
+) where
+    S: Symbol,
+    I: Index,
+    L: LimitProvider,
+{
+    let total = x.len() + y.len();
+    if chunks <= 1 || total < MERGE_SPLIT_MIN || x.is_empty() || y.is_empty() {
+        merge(text, lp, x, y, lcp_x, lcp_y, z, lcp_z, max_ctx, dispatch);
+        return;
+    }
+
+    // `x[i]` precedes `y[j]` exactly when the kernel would output it first,
+    // ties included: the kernel takes `y` on `Equal`, so the cut must too.
+    let x_first = |i: usize, j: usize| -> bool {
+        dispatch
+            .suffix_cmp_with(text, lp, x[i].to_usize(), y[j].to_usize(), max_ctx)
+            .is_lt()
+    };
+
+    let mut cuts: Vec<(usize, usize)> = Vec::with_capacity(chunks + 1);
+    cuts.push((0, 0));
+    for c in 1..chunks {
+        let t = c * total / chunks;
+        // Smallest `i` on the diagonal whose `x[i]` does not precede its
+        // opposite `y[t - i - 1]`.
+        let mut lo = t.saturating_sub(y.len());
+        let mut hi = t.min(x.len());
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let j = t - mid - 1;
+            if j < y.len() && x_first(mid, j) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        cuts.push((lo, t - lo));
+    }
+    cuts.push((x.len(), y.len()));
+
+    // Cut ranks are strictly increasing, but two of them can land on the same
+    // pair; an empty range would merge nothing and is dropped.
+    cuts.dedup();
+
+    let mut jobs: Vec<(usize, usize, usize, usize)> = Vec::with_capacity(cuts.len());
+    for w in cuts.windows(2) {
+        jobs.push((w[0].0, w[0].1, w[1].0, w[1].1));
+    }
+
+    // Hand each job its own output range.
+    let mut z_rest: &mut [I] = z;
+    let mut lcp_rest: &mut [I] = lcp_z;
+    let mut pieces: Vec<MergePiece<'_, I>> = Vec::with_capacity(jobs.len());
+    for &(i0, j0, i1, j1) in &jobs {
+        let out = (i1 - i0) + (j1 - j0);
+        let (zh, zt) = z_rest.split_at_mut(out);
+        let (lh, lt) = lcp_rest.split_at_mut(out);
+        pieces.push((i0, j0, i1, j1, zh, lh));
+        z_rest = zt;
+        lcp_rest = lt;
+    }
+
+    pieces.into_par_iter().for_each(|(i0, j0, i1, j1, zh, lh)| {
+        // State at the cut. `m` is the exact bounded LCP of the two
+        // fronts, and the previous output is whichever of `x[i0 - 1]` and
+        // `y[j0 - 1]` the kernel would have emitted last.
+        let (m, x_is_a) = if i0 == 0 && j0 == 0 {
+            (0usize, true)
+        } else {
+            // Which run produced the record before this range: the later
+            // of the two predecessors at the cut.
+            let x_is_a = if i0 == 0 {
+                false
+            } else if j0 == 0 {
+                true
+            } else {
+                !dispatch
+                    .suffix_cmp_with(
+                        text,
+                        lp,
+                        x[i0 - 1].to_usize(),
+                        y[j0 - 1].to_usize(),
+                        max_ctx,
+                    )
+                    .is_lt()
+            };
+            // The kernel's running LCP is between the *previous output*
+            // and the front of the run it did not come from, which is not
+            // the same as the LCP between the two fronts: the two coincide
+            // only on the step that extends the scan. Handing it the
+            // latter reorders the first records of the range.
+            let prev = if x_is_a {
+                x[i0 - 1].to_usize()
+            } else {
+                y[j0 - 1].to_usize()
+            };
+            let front_b = if x_is_a {
+                (j0 < y.len()).then(|| y[j0].to_usize())
+            } else {
+                (i0 < x.len()).then(|| x[i0].to_usize())
+            };
+            let m = match front_b {
+                Some(q) => {
+                    let lim = lp.lim_at(prev).min(lp.lim_at(q)).min(max_ctx);
+                    dispatch.lcp(text, prev, q, lim)
+                }
+                None => 0,
+            };
+            (m, x_is_a)
+        };
+        merge_resume(
+            text,
+            lp,
+            &x[i0..i1],
+            &y[j0..j1],
+            &lcp_x[i0..i1],
+            &lcp_y[j0..j1],
+            zh,
+            lh,
+            max_ctx,
+            dispatch,
+            m,
+            x_is_a,
+        );
+    });
+
+    // The first record of every range after the first takes its LCP against
+    // the last record of the range before it. A range that degenerated to a
+    // copy took its source run's value instead, which is only right when the
+    // previous output came from that same run, so it is recomputed here for
+    // all of them.
+    let mut at = 0usize;
+    for &(i0, j0, i1, j1) in &jobs {
+        let out = (i1 - i0) + (j1 - j0);
+        if at > 0 && out > 0 {
+            let (p, q) = (z[at - 1].to_usize(), z[at].to_usize());
+            let lim = lp.lim_at(p).min(lp.lim_at(q)).min(max_ctx);
+            lcp_z[at] = I::from_usize(dispatch.lcp(text, p, q, lim));
+        }
+        at += out;
+    }
 }
 
 /// Phase-4 variant of [`merge`] that reuses exact LCP intervals discovered by
@@ -638,6 +864,145 @@ fn drain<I: Index>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A split merge must produce the same records *and* the same LCP array as
+    /// the sequential one, on both a plain text and a segmented one under
+    /// STAR's boundary order. The LCP array is the part that can silently go
+    /// wrong: a cut hands the resumed kernel a running LCP and a labelling,
+    /// and getting either wrong reorders suffixes one cascade level up rather
+    /// than failing here.
+    #[test]
+    fn split_merge_matches_sequential_merge() {
+        use crate::limits::SegmentedText;
+
+        struct StarSegmented {
+            inner: SegmentedText,
+        }
+        impl LimitProvider for StarSegmented {
+            fn lim_at(&self, p: usize) -> usize {
+                self.inner.lim_at(p)
+            }
+            fn boundary_order(
+                &self,
+                p_a: usize,
+                lim_a: usize,
+                p_b: usize,
+                lim_b: usize,
+            ) -> std::cmp::Ordering {
+                lim_b.cmp(&lim_a).then(p_a.cmp(&p_b))
+            }
+        }
+
+        fn check<L: LimitProvider>(text: &[u8], lp: &L, dispatch: LcpDispatch) {
+            // Two sorted runs, each with its own LCP array, exactly what the
+            // cascade's last level holds.
+            let half = text.len() / 2;
+            let mut run_a: Vec<u32> = (0..half as u32).collect();
+            let mut run_b: Vec<u32> = (half as u32..text.len() as u32).collect();
+            let mut lcp_a = vec![0u32; run_a.len()];
+            let mut lcp_b = vec![0u32; run_b.len()];
+            let mut w_a = vec![0u32; run_a.len()];
+            let mut w_b = vec![0u32; run_b.len()];
+            let mut wl_a = vec![0u32; run_a.len()];
+            let mut wl_b = vec![0u32; run_b.len()];
+            merge_sort(
+                text,
+                lp,
+                &mut run_a,
+                &mut w_a,
+                &mut lcp_a,
+                &mut wl_a,
+                usize::MAX,
+                dispatch,
+            );
+            merge_sort(
+                text,
+                lp,
+                &mut run_b,
+                &mut w_b,
+                &mut lcp_b,
+                &mut wl_b,
+                usize::MAX,
+                dispatch,
+            );
+
+            let total = run_a.len() + run_b.len();
+            let mut z_seq = vec![0u32; total];
+            let mut l_seq = vec![0u32; total];
+            merge(
+                text,
+                lp,
+                &run_a,
+                &run_b,
+                &lcp_a,
+                &lcp_b,
+                &mut z_seq,
+                &mut l_seq,
+                usize::MAX,
+                dispatch,
+            );
+
+            for chunks in [2usize, 3, 7, 16] {
+                let mut z_par = vec![0u32; total];
+                let mut l_par = vec![0u32; total];
+                merge_split(
+                    text,
+                    lp,
+                    &run_a,
+                    &run_b,
+                    &lcp_a,
+                    &lcp_b,
+                    &mut z_par,
+                    &mut l_par,
+                    usize::MAX,
+                    dispatch,
+                    chunks,
+                );
+                assert_eq!(z_par, z_seq, "records differ at {chunks} chunks");
+                assert_eq!(l_par, l_seq, "LCP array differs at {chunks} chunks");
+            }
+        }
+
+        let mut state = 0x5EED_1234u64;
+        let mut lcg = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state >> 33
+        };
+        // Long enough to clear `MERGE_SPLIT_MIN`, and repetitive enough that
+        // ties reach the extension scan rather than resolving on byte one.
+        let n = MERGE_SPLIT_MIN + 4096;
+        let text: Vec<u8> = (0..n)
+            .map(|i| if i % 997 < 60 { 5 } else { (lcg() % 4) as u8 })
+            .collect();
+
+        let mut ends = Vec::new();
+        let mut in_run = false;
+        for (i, &b) in text.iter().enumerate() {
+            if b == 5 {
+                if in_run {
+                    ends.push(i as u64);
+                    in_run = false;
+                }
+            } else {
+                in_run = true;
+            }
+        }
+        if ends.last() != Some(&(text.len() as u64)) {
+            ends.push(text.len() as u64);
+        }
+
+        let dispatch = LcpDispatch::detect();
+        check(&text, &PlainText::new(text.len()), dispatch);
+        check(
+            &text,
+            &StarSegmented {
+                inner: SegmentedText::from_ends(text.len(), ends),
+            },
+            dispatch,
+        );
+    }
 
     /// Brute-force reference suffix array via `sort_by` over byte slices.
     fn brute_force_sa(text: &[u8]) -> Vec<u32> {
